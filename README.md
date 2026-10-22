@@ -12,6 +12,16 @@
 
 ---
 
+### 📸 界面预览 (Screenshots)
+
+<p align="center">
+  <img src="docs/screenshots/finefiles_home.png" width="360" alt="初晴文件主界面 (Home & Storage Sources)" />
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="docs/screenshots/finefiles_browser.png" width="360" alt="文件浏览界面 (File Browser)" />
+</p>
+
+---
+
 ### ✨ 核心特性
 
 - 🌐 **系统级存储提供者 (DocumentsProvider / SAF)**：
@@ -70,6 +80,16 @@ flutter build apk --release
 **FineFiles** is a modern, lightweight, and versatile file manager for Android, featuring first-class **Android Storage Access Framework (SAF / DocumentsProvider)** integration.
 
 In addition to sleek local file navigation, FineFiles mounts your private WebDAV, NAS, and cloud drives directly into the Android system document drawer, enabling third-party apps to access remote assets natively without downloading them first.
+
+---
+
+### 📸 Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/finefiles_home.png" width="360" alt="Home Dashboard" />
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="docs/screenshots/finefiles_browser.png" width="360" alt="File Browser" />
+</p>
 
 ---
 
