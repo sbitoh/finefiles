@@ -77,10 +77,16 @@ class FineDocumentsProvider : DocumentsProvider() {
 
     override fun onCreate(): Boolean {
         // Android DocumentsProvider 回调运行在系统的 Binder 线程池中，直接支持网络 I/O
-        // 允许网络访问与安全兜底
-        android.os.StrictMode.setThreadPolicy(android.os.StrictMode.ThreadPolicy.Builder().permitAll().build())
-        
-        // 全局绕过自签名证书/私有泛域名反代证书拦截 (兼容 Lucky/Nginx 反代 HTTPS 端口)
+        // 保持合理的线程策略，仅在必要时允许网络访问
+        try {
+            android.os.StrictMode.setThreadPolicy(android.os.StrictMode.ThreadPolicy.Builder().permitAll().build())
+        } catch (_: Exception) {}
+
+        return true
+    }
+
+    // 针对用户自建 WebDAV (如 Lucky / Nginx 泛域名 / 私有证书) 单独构建 SSL 配置，绝不污染全局 JVM 默认设置
+    private val webDavSslSocketFactory: javax.net.ssl.SSLSocketFactory? by lazy {
         try {
             val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
                 override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
@@ -89,14 +95,20 @@ class FineDocumentsProvider : DocumentsProvider() {
             })
             val sslContext = SSLContext.getInstance("TLS")
             sslContext.init(null, trustAllCerts, SecureRandom())
-            HttpsURLConnection.setDefaultSSLSocketFactory(sslContext.socketFactory)
-            HttpsURLConnection.setDefaultHostnameVerifier(HostnameVerifier { _, _ -> true })
-            android.util.Log.i("FineDocProvider", "Global SSL trust-all initialized for HTTPS WebDAV")
+            sslContext.socketFactory
         } catch (e: Exception) {
-            android.util.Log.e("FineDocProvider", "Failed to init SSL trust-all", e)
+            android.util.Log.e("FineDocProvider", "Failed to init dedicated WebDAV SSLContext", e)
+            null
         }
+    }
 
-        return true
+    private val permissiveHostnameVerifier = HostnameVerifier { _, _ -> true }
+
+    private fun configureWebDavSsl(conn: HttpURLConnection) {
+        if (conn is HttpsURLConnection) {
+            webDavSslSocketFactory?.let { conn.sslSocketFactory = it }
+            conn.hostnameVerifier = permissiveHostnameVerifier
+        }
     }
 
     private fun getStorageAccounts(): List<StorageAccount> {
@@ -229,11 +241,8 @@ class FineDocumentsProvider : DocumentsProvider() {
         val name = if (path == "/" || path.isEmpty()) acc?.name ?: "Cloud Storage" else File(path).name
 
         val isDir = path == "/" || path.endsWith("/") || parts.size == 1
-        val flags = if (isDir) {
-            DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE
-        } else {
-            DocumentsContract.Document.FLAG_SUPPORTS_WRITE or DocumentsContract.Document.FLAG_SUPPORTS_DELETE
-        }
+        // SAF 当前提供原生只读浏览与直接打开能力，杜绝外部 App 尝试写入导致的崩溃与数据丢失
+        val flags = 0
         val mimeType = if (isDir) {
             DocumentsContract.Document.MIME_TYPE_DIR
         } else {
@@ -365,11 +374,7 @@ class FineDocumentsProvider : DocumentsProvider() {
                 android.util.Log.i("FineDocProvider", "queryChildDocuments WebDAV returned ${files.size} items")
                 for (f in files) {
                     val docId = "$accId:${f.path}"
-                    val flags = if (f.isDir) {
-                        DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE
-                    } else {
-                        DocumentsContract.Document.FLAG_SUPPORTS_WRITE or DocumentsContract.Document.FLAG_SUPPORTS_DELETE
-                    }
+                    val flags = 0
                     val row = result.newRow()
                     for (col in proj) {
                         when (col) {
@@ -391,11 +396,7 @@ class FineDocumentsProvider : DocumentsProvider() {
                 val files = fetchBaiduChildren(acc, parentPath)
                 for (f in files) {
                     val docId = "$accId:${f.path}"
-                    val flags = if (f.isDir) {
-                        DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE
-                    } else {
-                        DocumentsContract.Document.FLAG_SUPPORTS_WRITE or DocumentsContract.Document.FLAG_SUPPORTS_DELETE
-                    }
+                    val flags = 0
                     val row = result.newRow()
                     for (col in proj) {
                         when (col) {
@@ -417,11 +418,7 @@ class FineDocumentsProvider : DocumentsProvider() {
                 val files = fetchAlipanChildren(acc, parentPath)
                 for (f in files) {
                     val docId = "$accId:${f.path}"
-                    val flags = if (f.isDir) {
-                        DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE
-                    } else {
-                        DocumentsContract.Document.FLAG_SUPPORTS_WRITE or DocumentsContract.Document.FLAG_SUPPORTS_DELETE
-                    }
+                    val flags = 0
                     val row = result.newRow()
                     for (col in proj) {
                         when (col) {
@@ -443,11 +440,7 @@ class FineDocumentsProvider : DocumentsProvider() {
                 val files = fetchQuarkChildren(acc, parentPath)
                 for (f in files) {
                     val docId = "$accId:${f.path}"
-                    val flags = if (f.isDir) {
-                        DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE
-                    } else {
-                        DocumentsContract.Document.FLAG_SUPPORTS_WRITE or DocumentsContract.Document.FLAG_SUPPORTS_DELETE
-                    }
+                    val flags = 0
                     val row = result.newRow()
                     for (col in proj) {
                         when (col) {
@@ -474,6 +467,9 @@ class FineDocumentsProvider : DocumentsProvider() {
         signal: CancellationSignal?
     ): ParcelFileDescriptor {
         val isWrite = mode.indexOf('w') != -1
+        if (isWrite) {
+            throw UnsupportedOperationException("FineFiles SAF provider currently operates in high-integrity read-only mode to prevent remote data loss. Please use the FineFiles app to upload or modify files.")
+        }
         val parts = documentId.split(":", limit = 2)
         val accId = parts[0]
         val path = if (parts.size > 1 && parts[1].isNotEmpty()) parts[1] else "/"
@@ -486,11 +482,21 @@ class FineDocumentsProvider : DocumentsProvider() {
         val cacheDir = File(ctx.cacheDir, "webdav_cache")
         if (!cacheDir.exists()) cacheDir.mkdirs()
 
-        val safeName = "${accId}_${File(path).name}"
+        // 缓存控制：若超出 300MB，清理最旧的文件
+        cleanCacheIfNeeded(cacheDir, 300 * 1024 * 1024L)
+
+        // 使用路径哈希作为文件名的一部分，彻底杜绝不同文件夹下同名文件覆盖 BUG
+        val pathHash = try {
+            val md = java.security.MessageDigest.getInstance("MD5")
+            md.digest(path.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }.take(8)
+        } catch (_: Exception) {
+            path.hashCode().toString()
+        }
+        val safeName = "${accId}_${pathHash}_${File(path).name}"
         val localFile = File(cacheDir, safeName)
 
         // 如果是读取，先下载远端文件
-        if (!isWrite && (!localFile.exists() || localFile.length() == 0L)) {
+        if (!localFile.exists() || localFile.length() == 0L) {
             if (acc.type == "baidu") {
                 downloadBaiduFile(acc, path, localFile)
             } else if (acc.type == "alipan") {
@@ -504,6 +510,23 @@ class FineDocumentsProvider : DocumentsProvider() {
 
         val accessMode = ParcelFileDescriptor.parseMode(mode)
         return ParcelFileDescriptor.open(localFile, accessMode)
+    }
+
+    private fun cleanCacheIfNeeded(cacheDir: File, maxSizeBytes: Long) {
+        try {
+            val files = cacheDir.listFiles() ?: return
+            var totalSize = files.sumOf { it.length() }
+            if (totalSize > maxSizeBytes) {
+                val sorted = files.sortedBy { it.lastModified() }
+                for (f in sorted) {
+                    val len = f.length()
+                    if (f.delete()) {
+                        totalSize -= len
+                    }
+                    if (totalSize < maxSizeBytes * 0.7) break
+                }
+            }
+        } catch (_: Exception) {}
     }
 
     private fun fetchBaiduChildren(acc: StorageAccount, folderPath: String): List<WebDavEntry> {
@@ -617,17 +640,18 @@ class FineDocumentsProvider : DocumentsProvider() {
 
         val url = URL(fullUrl)
         val conn = url.openConnection() as HttpURLConnection
+        configureWebDavSsl(conn)
         // 允许跟随重定向 (针对部分 WebDAV 服务器末尾斜杠重定向)
         conn.instanceFollowRedirects = true
         setRequestMethodViaReflection(conn, "PROPFIND")
         conn.setRequestProperty("Depth", "1")
-        conn.setRequestProperty("User-Agent", "FineFiles/1.0")
+        conn.setRequestProperty("User-Agent", "FineFiles/1.1")
         if (acc.username.isNotEmpty()) {
             val auth = Base64.encodeToString("${acc.username}:${acc.password}".toByteArray(), Base64.NO_WRAP)
             conn.setRequestProperty("Authorization", "Basic $auth")
         }
-        conn.connectTimeout = 6000
-        conn.readTimeout = 10000
+        conn.connectTimeout = 8000
+        conn.readTimeout = 15000
 
         try {
             val code = conn.responseCode
@@ -639,6 +663,13 @@ class FineDocumentsProvider : DocumentsProvider() {
 
                 val factory = DocumentBuilderFactory.newInstance()
                 factory.isNamespaceAware = false
+                try {
+                    factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+                    factory.setFeature("http://xml.org/sax/features/external-general-entities", false)
+                    factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+                    factory.isXIncludeAware = false
+                    factory.isExpandEntityReferences = false
+                } catch (_: Exception) {}
                 val builder = factory.newDocumentBuilder()
                 val doc = builder.parse(org.xml.sax.InputSource(java.io.StringReader(rawXml)))
                 var responses = doc.getElementsByTagName("d:response")
@@ -975,6 +1006,7 @@ class FineDocumentsProvider : DocumentsProvider() {
         val cleanPath = remotePath.trim('/')
         val url = URL("$cleanServer/$cleanPath")
         val conn = url.openConnection() as HttpURLConnection
+        configureWebDavSsl(conn)
         if (acc.username.isNotEmpty()) {
             val auth = Base64.encodeToString("${acc.username}:${acc.password}".toByteArray(), Base64.NO_WRAP)
             conn.setRequestProperty("Authorization", "Basic $auth")

@@ -14,6 +14,14 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter/services.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+class _DigestAccumulator implements Sink<Digest> {
+  Digest? value;
+  @override
+  void add(Digest data) => value = data;
+  @override
+  void close() {}
+}
+
 // --------------------------------------------------------------------------
 // 阿里云盘内置网页/扫码登录提取 Refresh Token 页面
 // --------------------------------------------------------------------------
@@ -62,8 +70,9 @@ class _AlipanLoginScreenState extends State<AlipanLoginScreen> {
     try {
       final tokenJson = await _controller.runJavaScriptReturningResult('localStorage.getItem("token")') as String;
       if (tokenJson.isNotEmpty && tokenJson != 'null' && tokenJson != '""') {
-        final decoded = jsonDecode(tokenJson is String && (tokenJson.startsWith('"') || tokenJson.startsWith('"{')) ? jsonDecode(tokenJson) : tokenJson);
-        final refreshToken = decoded['refresh_token'] as String?;
+        dynamic parsed = jsonDecode(tokenJson);
+        if (parsed is String) parsed = jsonDecode(parsed);
+        final refreshToken = parsed['refresh_token'] as String?;
         if (refreshToken != null && refreshToken.isNotEmpty) {
           _checkTimer?.cancel();
           if (mounted) {
@@ -602,11 +611,22 @@ class QuarkUploader {
     final callbackData = data['callback'];
     final partSize = (preJson['metadata']?['part_size'] as num?)?.toInt() ?? 4194304;
 
-    // 步骤 2: 计算全文件 MD5 与 SHA1 并同步更新 hash
+    // 步骤 2: 计算全文件 MD5 与 SHA1 并同步更新 hash (采用流式分块计算，杜绝大文件 OOM)
     try {
-      final wholeBytes = await file.readAsBytes();
-      final md5Str = md5.convert(wholeBytes).toString();
-      final sha1Str = sha1.convert(wholeBytes).toString();
+      final md5Sink = _DigestAccumulator();
+      final md5Input = md5.startChunkedConversion(md5Sink);
+      final sha1Sink = _DigestAccumulator();
+      final sha1Input = sha1.startChunkedConversion(sha1Sink);
+
+      await for (final chunk in file.openRead()) {
+        md5Input.add(chunk);
+        sha1Input.add(chunk);
+      }
+      md5Input.close();
+      sha1Input.close();
+
+      final md5Str = md5Sink.value?.toString() ?? '';
+      final sha1Str = sha1Sink.value?.toString() ?? '';
       final hashResp = await http.post(
         Uri.parse('https://drive.quark.cn/1/clouddrive/file/update/hash?pr=ucpro&fr=pc'),
         headers: {
@@ -642,6 +662,7 @@ class QuarkUploader {
     final totalParts = (fileSize / partSize).ceil();
     final List<String> etags = [];
     final raf = await file.open(mode: FileMode.read);
+    final ossClient = http.Client();
     int uploaded = 0;
 
     try {
@@ -658,8 +679,8 @@ class QuarkUploader {
         final months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
         final timeStr = '${weekdays[nowUtc.weekday - 1]}, ${nowUtc.day.toString().padLeft(2, '0')} ${months[nowUtc.month - 1]} ${nowUtc.year} ${nowUtc.hour.toString().padLeft(2, '0')}:${nowUtc.minute.toString().padLeft(2, '0')}:${nowUtc.second.toString().padLeft(2, '0')} GMT';
 
-        const mineType = 'application/octet-stream';
-        final authMeta = 'PUT\n\n$mineType\n$timeStr\nx-oss-date:$timeStr\nx-oss-user-agent:aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit\n/$bucket/$objKey?partNumber=$partNumber&uploadId=$uploadId';
+        const mimeType = 'application/octet-stream';
+        final authMeta = 'PUT\n\n$mimeType\n$timeStr\nx-oss-date:$timeStr\nx-oss-user-agent:aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit\n/$bucket/$objKey?partNumber=$partNumber&uploadId=$uploadId';
 
         // 获取 OSS 授权签名
         final authResp = await http.post(
@@ -685,13 +706,13 @@ class QuarkUploader {
         final ossReq = http.Request('PUT', Uri.parse(ossPutUrl));
         ossReq.headers.addAll({
           'Authorization': authKey,
-          'Content-Type': mineType,
+          'Content-Type': mimeType,
           'Referer': 'https://pan.quark.cn/',
           'x-oss-date': timeStr,
           'x-oss-user-agent': 'aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit',
         });
         ossReq.bodyBytes = chunkBytes;
-        final streamedOss = await http.Client().send(ossReq);
+        final streamedOss = await ossClient.send(ossReq);
         if (streamedOss.statusCode != 200) return false;
         final etag = streamedOss.headers['etag'] ?? streamedOss.headers['ETag'] ?? '';
         etags.add(etag);
@@ -701,6 +722,7 @@ class QuarkUploader {
       }
     } finally {
       await raf.close();
+      ossClient.close();
     }
 
     // 提交 commit
@@ -2233,7 +2255,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 4),
             Text(
-              'v1.0.0 (Build 20261020)',
+              'v1.1.0 (Build 20261120)',
               style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
             ),
             const SizedBox(height: 16),
@@ -4741,25 +4763,33 @@ class _FileBrowserScreenState extends State<FileBrowserScreen> {
         }
         if (downloadUrl != null) {
           final client = http.Client();
-          final req = http.Request('GET', Uri.parse(downloadUrl));
-          req.headers['User-Agent'] = 'pan.baidu.com';
-          if (cookie.isNotEmpty) req.headers['Cookie'] = cookie;
-          final streamed = await client.send(req);
-          if (streamed.statusCode == 200) {
-            final localFile = File('${downloadDir.path}/${item.name}');
-            final sink = localFile.openWrite();
-            int received = 0;
-            final total = streamed.contentLength ?? item.size;
-            await streamed.stream.listen((chunk) {
-              sink.add(chunk);
-              received += chunk.length;
-              if (total > 0 && setProgressState != null) {
-                setProgressState!(() {
-                  progress = received / total;
-                });
+          try {
+            final req = http.Request('GET', Uri.parse(downloadUrl));
+            req.headers['User-Agent'] = 'pan.baidu.com';
+            if (cookie.isNotEmpty) req.headers['Cookie'] = cookie;
+            final streamed = await client.send(req);
+            if (streamed.statusCode == 200) {
+              final localFile = File('${downloadDir.path}/${item.name}');
+              final sink = localFile.openWrite();
+              try {
+                int received = 0;
+                final total = streamed.contentLength ?? item.size;
+                await streamed.stream.listen((chunk) {
+                  sink.add(chunk);
+                  received += chunk.length;
+                  if (total > 0 && setProgressState != null) {
+                    setProgressState!(() {
+                      progress = received / total;
+                    });
+                  }
+                }).asFuture();
+              } finally {
+                await sink.flush();
+                await sink.close();
               }
-            }).asFuture();
-            await sink.close();
+            }
+          } finally {
+            client.close();
           }
         }
       } else if (acc.type == 'alipan') {
@@ -4797,25 +4827,33 @@ class _FileBrowserScreenState extends State<FileBrowserScreen> {
             final downloadUrl = dData['url'] ?? dData['cdn_url'] ?? '';
             if (downloadUrl.isNotEmpty) {
               final client = http.Client();
-              final req = http.Request('GET', Uri.parse(downloadUrl));
-              req.headers['User-Agent'] = 'Mozilla/5.0';
-              req.headers['Referer'] = 'https://www.aliyundrive.com/';
-              final streamed = await client.send(req);
-              if (streamed.statusCode == 200) {
-                final localFile = File('${downloadDir.path}/${item.name}');
-                final sink = localFile.openWrite();
-                int received = 0;
-                final total = streamed.contentLength ?? item.size;
-                await streamed.stream.listen((chunk) {
-                  sink.add(chunk);
-                  received += chunk.length;
-                  if (total > 0 && setProgressState != null) {
-                    setProgressState!(() {
-                      progress = received / total;
-                    });
+              try {
+                final req = http.Request('GET', Uri.parse(downloadUrl));
+                req.headers['User-Agent'] = 'Mozilla/5.0';
+                req.headers['Referer'] = 'https://www.aliyundrive.com/';
+                final streamed = await client.send(req);
+                if (streamed.statusCode == 200) {
+                  final localFile = File('${downloadDir.path}/${item.name}');
+                  final sink = localFile.openWrite();
+                  try {
+                    int received = 0;
+                    final total = streamed.contentLength ?? item.size;
+                    await streamed.stream.listen((chunk) {
+                      sink.add(chunk);
+                      received += chunk.length;
+                      if (total > 0 && setProgressState != null) {
+                        setProgressState!(() {
+                          progress = received / total;
+                        });
+                      }
+                    }).asFuture();
+                  } finally {
+                    await sink.flush();
+                    await sink.close();
                   }
-                }).asFuture();
-                await sink.close();
+                }
+              } finally {
+                client.close();
               }
             }
           }
@@ -4845,29 +4883,35 @@ class _FileBrowserScreenState extends State<FileBrowserScreen> {
               if (downloadUrl.isNotEmpty) {
                 final localFile = File('${downloadDir.path}/${item.name}');
                 final sink = localFile.openWrite();
-                final total = item.size > 0 ? item.size : (dData['data'][0]['size'] as num? ?? 1).toInt();
-                int received = 0;
-                final chunkSize = 10 * 1024 * 1024; // AList 10MB 分片下载策略
-                for (int start = 0; start < total; start += chunkSize) {
-                  int end = start + chunkSize - 1;
-                  if (end >= total) end = total - 1;
-                  final partReq = http.Request('GET', Uri.parse(downloadUrl));
-                  partReq.headers['User-Agent'] = quarkUa;
-                  partReq.headers['Cookie'] = cookie;
-                  partReq.headers['Referer'] = 'https://pan.quark.cn/';
-                  partReq.headers['Range'] = 'bytes=$start-$end';
-                  final streamed = await http.Client().send(partReq);
-                  await streamed.stream.listen((chunk) {
-                    sink.add(chunk);
-                    received += chunk.length;
-                    if (total > 0 && setProgressState != null) {
-                      setProgressState!(() {
-                        progress = received / total;
-                      });
-                    }
-                  }).asFuture();
+                final quarkClient = http.Client();
+                try {
+                  final total = item.size > 0 ? item.size : (dData['data'][0]['size'] as num? ?? 1).toInt();
+                  int received = 0;
+                  final chunkSize = 10 * 1024 * 1024; // AList 10MB 分片下载策略
+                  for (int start = 0; start < total; start += chunkSize) {
+                    int end = start + chunkSize - 1;
+                    if (end >= total) end = total - 1;
+                    final partReq = http.Request('GET', Uri.parse(downloadUrl));
+                    partReq.headers['User-Agent'] = quarkUa;
+                    partReq.headers['Cookie'] = cookie;
+                    partReq.headers['Referer'] = 'https://pan.quark.cn/';
+                    partReq.headers['Range'] = 'bytes=$start-$end';
+                    final streamed = await quarkClient.send(partReq);
+                    await streamed.stream.listen((chunk) {
+                      sink.add(chunk);
+                      received += chunk.length;
+                      if (total > 0 && setProgressState != null) {
+                        setProgressState!(() {
+                          progress = received / total;
+                        });
+                      }
+                    }).asFuture();
+                  }
+                } finally {
+                  await sink.flush();
+                  await sink.close();
+                  quarkClient.close();
                 }
-                await sink.close();
               }
             }
           }
@@ -4879,24 +4923,32 @@ class _FileBrowserScreenState extends State<FileBrowserScreen> {
         final fullUrl = '$cleanServer/$cleanItemPath';
         try {
           final client = http.Client();
-          final req = http.Request('GET', Uri.parse(fullUrl));
-          req.headers.addAll(_buildHeaders());
-          final streamed = await client.send(req);
-          if (streamed.statusCode == 200) {
-            final localFile = File('${downloadDir.path}/${item.name}');
-            final sink = localFile.openWrite();
-            int received = 0;
-            final total = streamed.contentLength ?? item.size;
-            await streamed.stream.listen((chunk) {
-              sink.add(chunk);
-              received += chunk.length;
-              if (total > 0 && setProgressState != null) {
-                setProgressState!(() {
-                  progress = received / total;
-                });
+          try {
+            final req = http.Request('GET', Uri.parse(fullUrl));
+            req.headers.addAll(_buildHeaders());
+            final streamed = await client.send(req);
+            if (streamed.statusCode == 200) {
+              final localFile = File('${downloadDir.path}/${item.name}');
+              final sink = localFile.openWrite();
+              try {
+                int received = 0;
+                final total = streamed.contentLength ?? item.size;
+                await streamed.stream.listen((chunk) {
+                  sink.add(chunk);
+                  received += chunk.length;
+                  if (total > 0 && setProgressState != null) {
+                    setProgressState!(() {
+                      progress = received / total;
+                    });
+                  }
+                }).asFuture();
+              } finally {
+                await sink.flush();
+                await sink.close();
               }
-            }).asFuture();
-            await sink.close();
+            }
+          } finally {
+            client.close();
           }
         } catch (e) {
           debugPrint('Download error: $e');
@@ -5417,11 +5469,206 @@ class _FileBrowserScreenState extends State<FileBrowserScreen> {
     }
   }
 
-  // 临时下载并调用系统底层 Intent 分享到微信或其他应用
+  // 通用远程文件安全下载到临时缓存（支持 WebDAV、阿里云盘、夸克网盘、百度网盘）
+  Future<File?> _fetchRemoteFileToTemp(FileItem item, {void Function(double)? onProgress}) async {
+    try {
+      final tempDir = await getTemporaryDirectory();
+      final cacheFolder = Directory('${tempDir.path}/remote_cache');
+      if (!await cacheFolder.exists()) await cacheFolder.create(recursive: true);
+      final tempFile = File('${cacheFolder.path}/${item.name}');
+
+      final acc = widget.account;
+      if (acc.type == 'baidu') {
+        var token = acc.password.isNotEmpty ? acc.password : acc.extraToken;
+        String? downloadUrl;
+        final fsId = item.extra?['fs_id'] ?? item.path;
+        final metaUrl = 'https://pan.baidu.com/rest/2.0/xpan/multimedia?method=filemetas&fsids=[$fsId]&dlink=1';
+        final mResp = await http.get(Uri.parse(metaUrl), headers: {
+          'Cookie': token.contains('BDUSS') ? token : '',
+          'User-Agent': 'pan.baidu.com',
+        });
+        if (mResp.statusCode == 200) {
+          final mData = jsonDecode(mResp.body);
+          if (mData['errno'] == 0 && (mData['list'] as List).isNotEmpty) {
+            downloadUrl = mData['list'][0]['dlink'];
+          }
+        }
+        if (downloadUrl != null) {
+          final client = http.Client();
+          try {
+            final req = http.Request('GET', Uri.parse(downloadUrl));
+            req.headers['User-Agent'] = 'pan.baidu.com';
+            if (token.contains('BDUSS')) req.headers['Cookie'] = token;
+            final streamed = await client.send(req);
+            if (streamed.statusCode == 200) {
+              final sink = tempFile.openWrite();
+              try {
+                int received = 0;
+                final total = streamed.contentLength ?? item.size;
+                await streamed.stream.listen((chunk) {
+                  sink.add(chunk);
+                  received += chunk.length;
+                  if (total > 0 && onProgress != null) onProgress(received / total);
+                }).asFuture();
+              } finally {
+                await sink.flush();
+                await sink.close();
+              }
+              return tempFile;
+            }
+          } finally {
+            client.close();
+          }
+        }
+      } else if (acc.type == 'alipan') {
+        var token = acc.password.isNotEmpty ? acc.password : acc.extraToken;
+        if (token.length == 32) {
+          final rResp = await http.post(
+            Uri.parse('https://api.aliyundrive.com/token/refresh'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'refresh_token': token}),
+          );
+          if (rResp.statusCode == 200) token = jsonDecode(rResp.body)['access_token'];
+        }
+        var driveId = acc.serverUrl;
+        if (driveId == 'resource' || driveId.isEmpty) {
+          final uResp = await http.post(
+            Uri.parse('https://user.aliyundrive.com/v2/user/get'),
+            headers: {'Authorization': 'Bearer $token', 'Content-Type': 'application/json'},
+            body: '{}',
+          );
+          if (uResp.statusCode == 200) {
+            final uData = jsonDecode(uResp.body);
+            driveId = uData['resource_drive_id'] ?? uData['default_drive_id'] ?? '';
+          }
+        }
+        final dUrl = 'https://bj29.api.aliyunpds.com/v2/file/get_download_url';
+        final dResp = await http.post(
+          Uri.parse(dUrl),
+          headers: {'Authorization': 'Bearer $token', 'Content-Type': 'application/json', 'Referer': 'https://www.aliyundrive.com/'},
+          body: jsonEncode({'drive_id': driveId, 'file_id': item.path, 'expire_sec': 14400}),
+        );
+        if (dResp.statusCode == 200) {
+          final dData = jsonDecode(dResp.body);
+          final downloadUrl = dData['url'] ?? dData['cdn_url'] ?? '';
+          if (downloadUrl.isNotEmpty) {
+            final client = http.Client();
+            try {
+              final req = http.Request('GET', Uri.parse(downloadUrl));
+              req.headers['User-Agent'] = 'Mozilla/5.0';
+              req.headers['Referer'] = 'https://www.aliyundrive.com/';
+              final streamed = await client.send(req);
+              if (streamed.statusCode == 200) {
+                final sink = tempFile.openWrite();
+                try {
+                  int received = 0;
+                  final total = streamed.contentLength ?? item.size;
+                  await streamed.stream.listen((chunk) {
+                    sink.add(chunk);
+                    received += chunk.length;
+                    if (total > 0 && onProgress != null) onProgress(received / total);
+                  }).asFuture();
+                } finally {
+                  await sink.flush();
+                  await sink.close();
+                }
+                return tempFile;
+              }
+            } finally {
+              client.close();
+            }
+          }
+        }
+      } else if (acc.type == 'quark') {
+        var cookie = acc.extraToken;
+        if (!cookie.contains('=')) cookie = '__puus=$cookie';
+        final dUrl = 'https://drive.quark.cn/1/clouddrive/file/download?pr=ucpro&fr=pc';
+        const quarkUa = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch';
+        final dResp = await http.post(
+          Uri.parse(dUrl),
+          headers: {
+            'Cookie': cookie,
+            'User-Agent': quarkUa,
+            'Referer': 'https://pan.quark.cn/',
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({'fids': [item.path]}),
+        );
+        if (dResp.statusCode == 200) {
+          final dData = jsonDecode(dResp.body);
+          if (dData['data'] != null && (dData['data'] as List).isNotEmpty) {
+            final downloadUrl = dData['data'][0]['download_url'] ?? '';
+            if (downloadUrl.isNotEmpty) {
+              final sink = tempFile.openWrite();
+              final quarkClient = http.Client();
+              try {
+                final total = item.size > 0 ? item.size : (dData['data'][0]['size'] as num? ?? 1).toInt();
+                int received = 0;
+                final chunkSize = 10 * 1024 * 1024;
+                for (int start = 0; start < total; start += chunkSize) {
+                  int end = start + chunkSize - 1;
+                  if (end >= total) end = total - 1;
+                  final partReq = http.Request('GET', Uri.parse(downloadUrl));
+                  partReq.headers['User-Agent'] = quarkUa;
+                  partReq.headers['Cookie'] = cookie;
+                  partReq.headers['Referer'] = 'https://pan.quark.cn/';
+                  partReq.headers['Range'] = 'bytes=$start-$end';
+                  final streamed = await quarkClient.send(partReq);
+                  await streamed.stream.listen((chunk) {
+                    sink.add(chunk);
+                    received += chunk.length;
+                    if (total > 0 && onProgress != null) onProgress(received / total);
+                  }).asFuture();
+                }
+              } finally {
+                await sink.flush();
+                await sink.close();
+                quarkClient.close();
+              }
+              return tempFile;
+            }
+          }
+        }
+      } else {
+        // WebDAV
+        final cleanServer = acc.serverUrl.replaceAll(RegExp(r'/+$'), '');
+        final cleanItemPath = item.path.replaceAll(RegExp(r'^/+|/+$'), '');
+        final fullUrl = '$cleanServer/$cleanItemPath';
+        final client = http.Client();
+        try {
+          final req = http.Request('GET', Uri.parse(fullUrl));
+          req.headers.addAll(_buildHeaders());
+          final streamed = await client.send(req);
+          if (streamed.statusCode == 200) {
+            final sink = tempFile.openWrite();
+            try {
+              int received = 0;
+              final total = streamed.contentLength ?? item.size;
+              await streamed.stream.listen((chunk) {
+                sink.add(chunk);
+                received += chunk.length;
+                if (total > 0 && onProgress != null) onProgress(received / total);
+              }).asFuture();
+            } finally {
+              await sink.flush();
+              await sink.close();
+            }
+            return tempFile;
+          }
+        } finally {
+          client.close();
+        }
+      }
+    } catch (e) {
+      debugPrint('Fetch remote file error: $e');
+    }
+    return null;
+  }
+
+  // 临时下载并调起系统分享
   Future<void> _shareRemoteFile(FileItem item) async {
-    // 弹窗展示下载缓冲进度
+    void Function(void Function())? setProgressState;
     double progress = 0.0;
-    StateSetter? setProgressState;
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -5447,38 +5694,21 @@ class _FileBrowserScreenState extends State<FileBrowserScreen> {
     );
 
     try {
-      final tempDir = await getTemporaryDirectory();
-      final shareFolder = Directory('${tempDir.path}/share');
-      if (!await shareFolder.exists()) await shareFolder.create(recursive: true);
-      final tempFile = File('${shareFolder.path}/${item.name}');
-
-      final cleanServer = widget.account.serverUrl.replaceAll(RegExp(r'/+$'), '');
-      final cleanItemPath = item.path.replaceAll(RegExp(r'^/+|/+$'), '');
-      final fullUrl = '$cleanServer/$cleanItemPath';
-
-      final client = http.Client();
-      final req = http.Request('GET', Uri.parse(fullUrl));
-      req.headers.addAll(_buildHeaders());
-      final streamed = await client.send(req);
-
-      int received = 0;
-      final total = streamed.contentLength ?? item.size;
-      final sink = tempFile.openWrite();
-      await streamed.stream.listen((chunk) {
-        sink.add(chunk);
-        received += chunk.length;
-        if (total > 0 && setProgressState != null) {
+      final tempFile = await _fetchRemoteFileToTemp(item, onProgress: (p) {
+        if (setProgressState != null) {
           setProgressState!(() {
-            progress = received / total;
+            progress = p;
           });
         }
-      }).asFuture();
-      await sink.close();
-
-      if (mounted) Navigator.pop(context); // 关闭缓冲框
-
-      // 调起系统原生分享器，直接选择微信发送
-      await Share.shareXFiles([XFile(tempFile.path)], text: item.name);
+      });
+      if (mounted) Navigator.pop(context);
+      if (tempFile != null && await tempFile.exists()) {
+        await Share.shareXFiles([XFile(tempFile.path)], text: item.name);
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('获取文件失败，请检查网络')));
+        }
+      }
     } catch (e) {
       if (mounted) Navigator.pop(context);
       debugPrint('Share error: $e');
@@ -5490,48 +5720,15 @@ class _FileBrowserScreenState extends State<FileBrowserScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text('正在缓冲 ${item.name}...')),
     );
-    try {
-      final cleanServer = widget.account.serverUrl.replaceAll(RegExp(r'/+$'), '');
-      final cleanItemPath = item.path.replaceAll(RegExp(r'^/+|/+$'), '');
-      final tempDir = await getTemporaryDirectory();
-      final tempFile = File('${tempDir.path}/${item.name}');
-
-      if (widget.account.type == 'baidu') {
-        var token = widget.account.password.isNotEmpty ? widget.account.password : widget.account.extraToken;
-        if (token.startsWith('122.')) {
-          try {
-            final refreshUrl = 'https://openapi.baidu.com/oauth/2.0/token?grant_type=refresh_token&refresh_token=$token&client_id=[REDACTED]&client_secret=[REDACTED]';
-            final rResp = await http.get(Uri.parse(refreshUrl));
-            final rDec = jsonDecode(rResp.body);
-            if (rDec['access_token'] != null) {
-              token = rDec['access_token'];
-            }
-          } catch (_) {}
-        }
-        final dlinkUrl = 'https://d.pcs.baidu.com/rest/2.0/pcs/file?method=download&access_token=$token&path=${Uri.encodeComponent(item.path)}';
-        final client = http.Client();
-        final req = http.Request('GET', Uri.parse(dlinkUrl));
-        req.headers['User-Agent'] = 'netdisk';
-        final streamed = await client.send(req);
-        if (streamed.statusCode == 200 || streamed.statusCode == 302) {
-          final sink = tempFile.openWrite();
-          await streamed.stream.pipe(sink);
-          await OpenFile.open(tempFile.path);
-        }
-      } else {
-        final fullUrl = '$cleanServer/$cleanItemPath';
-        final resp = await http.get(Uri.parse(fullUrl), headers: _buildHeaders());
-        if (resp.statusCode == 200) {
-          await tempFile.writeAsBytes(resp.bodyBytes);
-          await OpenFile.open(tempFile.path);
-        } else {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('加载失败 HTTP ${resp.statusCode}')),
-          );
-        }
+    final tempFile = await _fetchRemoteFileToTemp(item);
+    if (tempFile != null && await tempFile.exists()) {
+      await OpenFile.open(tempFile.path);
+    } else {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('打开 ${item.name} 失败，请检查网络')),
+        );
       }
-    } catch (e) {
-      debugPrint('Open error: $e');
     }
   }
 

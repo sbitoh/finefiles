@@ -47,7 +47,9 @@ app.*.map.json
 # Widget Preview related
 .widget_preview/
 
-# Build and debug artifacts
+# Backup files
+*.bak.*
+
 *.apk
 *.pdf
 *.html

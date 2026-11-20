@@ -42,7 +42,8 @@
 ### 📥 下载安装
 
 - 🌐 **GitHub 官方渠道**：前往 [Releases](https://github.com/sbitoh/finefiles/releases) 页面下载最新 APK 安装包。
-- 📦 **本地离线包**：最新稳定编译版已命名为 `finefiles-v1.0.0.apk`。
+- 📦 **本地离线包**：最新稳定编译版已命名为 `finefiles-v1.1.0.apk`。
+- 📋 **更新历史**：详见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
